@@ -47,6 +47,7 @@ import paramiko
 import time
 import socket
 import select
+from datetime import datetime
 
 from rich.console import Console
 from rich.table import Table
@@ -156,6 +157,18 @@ class SSHManager:
         try:
             with sftp.file(remote_path, "w") as f:
                 f.write(content)
+        finally:
+            sftp.close()
+
+    # ────────────── SFTP 下载 ──────────────
+
+    def download_file(self, remote_path, local_path):
+        """将远程文件下载到本地"""
+        if not self.is_connected():
+            raise ConnectionError("SSH 未连接")
+        sftp = self.client.open_sftp()
+        try:
+            sftp.get(remote_path, local_path)
         finally:
             sftp.close()
 
@@ -387,6 +400,311 @@ def run_diag_script(ssh):
 
 
 # ═══════════════════════════════════════════════════════════════════
+#  Oracle AWR 报告拉取
+# ═══════════════════════════════════════════════════════════════════
+
+def detect_oracle_env(ssh):
+    """探测服务器上的 Oracle 环境，返回 (oracle_home, oracle_sid, sqlplus_path) 或 None"""
+
+    # 尝试从 oracle 用户的环境变量获取
+    _, oh_out, _ = ssh.exec_command("su - oracle -c 'echo $ORACLE_HOME'", timeout=10)
+    _, sid_out, _ = ssh.exec_command("su - oracle -c 'echo $ORACLE_SID'", timeout=10)
+
+    oracle_home = oh_out.strip()
+    oracle_sid = sid_out.strip()
+
+    # 如果有 ORACLE_HOME，尝试直接定位 sqlplus
+    if oracle_home:
+        _, sp_out, _ = ssh.exec_command(f"su - oracle -c 'ls {oracle_home}/bin/sqlplus 2>/dev/null'", timeout=10)
+        sqlplus_path = sp_out.strip()
+        if sqlplus_path:
+            return (oracle_home, oracle_sid, sqlplus_path)
+
+    # 兜底：全局搜索 sqlplus
+    _, find_out, _ = ssh.exec_command(
+        "timeout 30 find / -name sqlplus -type f 2>/dev/null | head -3", timeout=35
+    )
+    sqlplus_candidates = [line.strip() for line in find_out.strip().split("\n") if line.strip()]
+
+    if sqlplus_candidates:
+        sqlplus_path = sqlplus_candidates[0]
+        # 从路径反推 ORACLE_HOME（假设结构是 $ORACLE_HOME/bin/sqlplus）
+        oracle_home = os.path.dirname(os.path.dirname(sqlplus_path))
+
+        # 如果之前没拿到 SID，再尝试从 oracle 用户环境获取
+        if not oracle_sid:
+            _, sid_out2, _ = ssh.exec_command("su - oracle -c 'echo $ORACLE_SID'", timeout=10)
+            oracle_sid = sid_out2.strip()
+
+        return (oracle_home, oracle_sid, sqlplus_path)
+
+    return None
+
+
+def run_sql_as_oracle(ssh, oracle_home, oracle_sid, sql, timeout=300):
+    """以 oracle 用户执行 SQL*Plus 命令，返回 (exit_code, stdout, stderr)"""
+
+    # 构造 SQL 文件内容（统一设置 + 用户 SQL）
+    sql_content = f"""SET PAGESIZE 0 LINESIZE 32767 LONG 999999999 LONGCHUNKSIZE 32767
+SET HEADING OFF FEEDBACK OFF TRIMSPOOL ON TRIMOUT ON WRAP ON
+{sql}
+EXIT;
+"""
+
+    remote_sql_path = "/tmp/_awr_tmp.sql"
+
+    # 上传 SQL 文件
+    ssh.upload_text(remote_sql_path, sql_content)
+
+    # 设置权限
+    ssh.exec_command(f"chmod 644 {remote_sql_path}")
+
+    # 构造执行命令
+    cmd = f"""su - oracle -c '
+export ORACLE_HOME="{oracle_home}"
+export ORACLE_SID="{oracle_sid}"
+$ORACLE_HOME/bin/sqlplus -S / as sysdba @{remote_sql_path}
+'"""
+
+    exit_code, stdout, stderr = ssh.exec_command(cmd, timeout=timeout)
+
+    # 清理临时文件
+    try:
+        ssh.exec_command(f"rm -f {remote_sql_path}")
+    except Exception:
+        pass
+
+    return exit_code, stdout, stderr
+
+
+def fetch_awr_report(ssh):
+    """拉取 Oracle AWR 报告的主流程"""
+    console.print()
+    console.print(Panel(
+        "[bold]Oracle AWR 报告拉取[/bold]\n\n"
+        "将自动探测 Oracle 环境，查询指定时间段的快照，生成并下载 HTML 报告。",
+        title="📈 AWR",
+        border_style="cyan",
+    ))
+
+    # ── Step 1: 探测 Oracle 环境 ──
+    console.print()
+    with console.status("[bold cyan]正在探测 Oracle 环境...[/bold cyan]"):
+        env = detect_oracle_env(ssh)
+
+    if not env:
+        console.print(Panel(
+            "[red]未找到 Oracle 环境[/red]\n\n"
+            "请确认：\n"
+            "  1. 服务器已安装 Oracle 数据库\n"
+            "  2. 存在 oracle 用户\n"
+            "  3. 当前 SSH 用户有权限切换到 oracle",
+            title="❌ 错误",
+            border_style="red",
+        ))
+        return
+
+    oracle_home, oracle_sid, sqlplus_path = env
+    console.print(f"  [green]✔[/green] ORACLE_HOME = [bold]{oracle_home}[/bold]")
+    console.print(f"  [green]✔[/green] ORACLE_SID  = [bold]{oracle_sid}[/bold]")
+    console.print(f"  [green]✔[/green] sqlplus     = [dim]{sqlplus_path}[/dim]")
+
+    # ── Step 2: 用户输入时间范围 ──
+    console.print()
+    console.print("  [bold]请输入时间范围[/bold] (格式: YYYY-MM-DD HH24:MI)")
+    console.print("  [dim]示例: 2026-06-08 08:00[/dim]")
+
+    while True:
+        start_time = Prompt.ask("\n  起始时间")
+        try:
+            start_dt = datetime.strptime(start_time, "%Y-%m-%d %H:%M")
+            break
+        except ValueError:
+            console.print("  [yellow]⚠ 时间格式错误，请使用 YYYY-MM-DD HH:MI 格式[/yellow]")
+
+    while True:
+        end_time = Prompt.ask("  结束时间")
+        try:
+            end_dt = datetime.strptime(end_time, "%Y-%m-%d %H:%M")
+            if end_dt <= start_dt:
+                console.print("  [yellow]⚠ 结束时间必须晚于起始时间[/yellow]")
+                continue
+            break
+        except ValueError:
+            console.print("  [yellow]⚠ 时间格式错误，请使用 YYYY-MM-DD HH:MI 格式[/yellow]")
+
+    # ── Step 3: 查询时间段内的快照 ──
+    console.print()
+    with console.status("[bold cyan]正在查询快照...[/bold cyan]"):
+        sql_query = f"""
+SELECT s.snap_id,
+       TO_CHAR(s.begin_interval_time, 'YYYY-MM-DD"T"HH24:MI:SS'),
+       TO_CHAR(s.end_interval_time,   'YYYY-MM-DD"T"HH24:MI:SS'),
+       s.instance_number,
+       (SELECT dbid FROM v$database) AS dbid
+FROM   dba_hist_snapshot s
+WHERE  s.begin_interval_time >= TO_DATE('{start_time}', 'YYYY-MM-DD HH24:MI')
+AND    s.end_interval_time   <= TO_DATE('{end_time}',   'YYYY-MM-DD HH24:MI')
+ORDER BY s.instance_number, s.snap_id;
+"""
+        exit_code, stdout, stderr = run_sql_as_oracle(ssh, oracle_home, oracle_sid, sql_query, timeout=30)
+
+    # 检查权限错误
+    if "ORA-00942" in stdout or "ORA-01031" in stdout:
+        console.print(Panel(
+            "[red]权限不足[/red]\n\n需要 DBA 角色才能访问 AWR 数据 (DBA_HIST_SNAPSHOT)",
+            title="❌ 错误",
+            border_style="red",
+        ))
+        return
+
+    # 解析快照列表
+    snapshots = []
+    for line in stdout.strip().split("\n"):
+        parts = line.split()
+        if len(parts) >= 5:
+            try:
+                snap_id = int(parts[0])
+                begin_time = parts[1].replace('T', ' ')
+                end_time_snap = parts[2].replace('T', ' ')
+                inst_num = int(parts[3])
+                dbid = int(parts[4])
+                snapshots.append({
+                    "snap_id": snap_id,
+                    "begin_time": begin_time,
+                    "end_time": end_time_snap,
+                    "instance_number": inst_num,
+                    "dbid": dbid,
+                })
+            except (ValueError, IndexError):
+                continue
+
+    # 无快照
+    if not snapshots:
+        console.print(Panel(
+            f"[red]指定时间段 ({start_time} ~ {end_time}) 内未找到快照数据[/red]\n\n"
+            "可能原因：\n"
+            "  1. 该时间段内 AWR 未开启或无快照\n"
+            "  2. 时间范围过窄，没有覆盖完整的快照周期\n"
+            "  3. 数据库实例在该时间段未运行",
+            title="❌ 错误",
+            border_style="red",
+        ))
+        return
+
+    # 展示快照列表
+    console.print()
+    table = Table(
+        box=box.ROUNDED,
+        show_header=True,
+        header_style="bold cyan",
+        border_style="cyan",
+        title=f"📊 时间段 ({start_time} ~ {end_time}) 内的快照",
+        title_style="bold",
+    )
+    table.add_column("SNAP_ID", style="bold", justify="right")
+    table.add_column("开始时间")
+    table.add_column("结束时间")
+    table.add_column("实例号", justify="center")
+
+    for snap in snapshots:
+        table.add_row(
+            str(snap["snap_id"]),
+            snap["begin_time"],
+            snap["end_time"],
+            str(snap["instance_number"]),
+        )
+
+    console.print(table)
+
+    # 多实例检测
+    instances = list(set(s["instance_number"] for s in snapshots))
+    if len(instances) > 1:
+        console.print()
+        console.print(f"  [yellow]⚠ 检测到多实例 (RAC): {instances}[/yellow]")
+        while True:
+            inst_choice = IntPrompt.ask("  请选择实例号", default=instances[0])
+            if inst_choice in instances:
+                selected_instance = inst_choice
+                break
+            console.print(f"  [yellow]⚠ 无效的实例号，可选: {instances}[/yellow]")
+    else:
+        selected_instance = instances[0]
+
+    # 过滤选定实例的快照
+    instance_snapshots = [s for s in snapshots if s["instance_number"] == selected_instance]
+
+    # ── Step 4: 用户选择起止快照 ID ──
+    console.print()
+    valid_ids = [s["snap_id"] for s in instance_snapshots]
+
+    while True:
+        begin_snap = IntPrompt.ask("  起始快照 ID (begin)")
+        if begin_snap in valid_ids:
+            break
+        console.print(f"  [yellow]⚠ 无效的快照 ID，可选范围: {min(valid_ids)} ~ {max(valid_ids)}[/yellow]")
+
+    while True:
+        end_snap = IntPrompt.ask("  结束快照 ID (end)")
+        if end_snap in valid_ids and end_snap > begin_snap:
+            break
+        console.print(f"  [yellow]⚠ 无效的快照 ID，必须大于 {begin_snap} 且在可选范围内[/yellow]")
+
+    # 获取 dbid
+    dbid = instance_snapshots[0]["dbid"]
+
+    # ── Step 5: 生成 AWR HTML 报告 ──
+    console.print()
+    report_filename = f"awr_{oracle_sid}_{begin_snap}_{end_snap}.html"
+    remote_report_path = f"/tmp/{report_filename}"
+
+    with console.status("[bold cyan]正在生成 AWR 报告 (可能需要 10-30 秒)...[/bold cyan]"):
+        sql_gen = f"""
+SPOOL {remote_report_path}
+SELECT output FROM TABLE(
+  DBMS_WORKLOAD_REPOSITORY.AWR_REPORT_HTML(
+    {dbid}, {selected_instance}, {begin_snap}, {end_snap}));
+SPOOL OFF
+"""
+        exit_code, stdout, stderr = run_sql_as_oracle(ssh, oracle_home, oracle_sid, sql_gen, timeout=300)
+
+    # 检查错误
+    if "ORA-" in stdout:
+        # 提取 ORA 错误
+        ora_errors = [line for line in stdout.split("\n") if "ORA-" in line]
+        console.print(Panel(
+            "[red]报告生成失败[/red]\n\n" + "\n".join(ora_errors),
+            title="❌ 错误",
+            border_style="red",
+        ))
+        return
+
+    # ── Step 6: 下载报告到本地 ──
+    local_awr_dir = os.path.join(SCRIPT_DIR, "awr_reports")
+    os.makedirs(local_awr_dir, exist_ok=True)
+    local_report_path = os.path.join(local_awr_dir, report_filename)
+
+    console.print("[cyan]⬇  正在下载报告...[/cyan]")
+    try:
+        ssh.download_file(remote_report_path, local_report_path)
+        console.print(f"  [green]✔ 报告已保存到:[/green] [bold]{local_report_path}[/bold]")
+    except Exception as e:
+        console.print(f"  [red]✘ 报告下载失败:[/red] {e}")
+        return
+
+    # 清理远程临时文件
+    try:
+        ssh.exec_command(f"rm -f {remote_report_path}")
+    except Exception:
+        pass
+
+    console.print()
+    console.print(f"[green]✔ AWR 报告拉取完成！[/green]")
+    console.print(f"  可直接在浏览器中打开: [bold]{local_report_path}[/bold]")
+    console.print()
+
+
+# ═══════════════════════════════════════════════════════════════════
 #  交互式 Shell
 # ═══════════════════════════════════════════════════════════════════
 
@@ -474,7 +792,8 @@ def print_menu(connected, host="", port=0, username=""):
             "  [bold cyan]\\[2][/bold cyan]  📊  查看系统基本信息  (快速采集)\n"
             "  [bold cyan]\\[3][/bold cyan]  🔍  运行完整负载诊断  (server_diag.sh)\n"
             "  [bold cyan]\\[4][/bold cyan]  🖥   交互式远程 Shell\n"
-            "  [bold cyan]\\[5][/bold cyan]  ❌  断开连接\n"
+            "  [bold cyan]\\[5][/bold cyan]  📈  拉取 Oracle AWR 报告\n"
+            "  [bold cyan]\\[6][/bold cyan]  ❌  断开连接\n"
             "  [bold cyan]\\[0][/bold cyan]  🚪  退出程序",
             title="📋 操作菜单",
             border_style="bright_blue",
@@ -581,6 +900,12 @@ def main():
                 interactive_shell(ssh)
 
             elif choice == 5:
+                if not ssh.is_connected():
+                    console.print("[yellow]⚠ 请先连接服务器 (选项 1)[/yellow]")
+                    continue
+                fetch_awr_report(ssh)
+
+            elif choice == 6:
                 if ssh.is_connected():
                     ssh.disconnect()
                     console.print("[green]✔ 已断开连接[/green]")

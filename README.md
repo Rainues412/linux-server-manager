@@ -28,6 +28,7 @@ pip install paramiko rich
 ```
 ├── server_manager.py    # 主程序（双击运行）
 ├── server_diag.sh       # 服务器负载诊断脚本（由主程序自动上传执行）
+├── awr_reports/         # Oracle AWR 报告保存目录（自动生成）
 └── README.md            # 本文件
 ```
 
@@ -51,8 +52,22 @@ python server_manager.py
 | 2 | 📊 系统基本信息 | 快速采集 CPU、内存、磁盘、网络、进程等 |
 | 3 | 🔍 完整负载诊断 | 自动上传 `server_diag.sh` 并执行 6 大维度检测 |
 | 4 | 🖥 交互式 Shell | 在远程服务器上自由执行命令 |
-| 5 | ❌ 断开连接 | 断开当前 SSH 连接 |
+| 5 | 📈 拉取 Oracle AWR 报告 | 自动探测 Oracle 环境，按时间范围查询快照并生成 HTML 报告 |
+| 6 | ❌ 断开连接 | 断开当前 SSH 连接 |
 | 0 | 🚪 退出程序 | 断开连接并退出 |
+
+### AWR 报告功能说明
+
+菜单选项 5 可自动拉取 Oracle AWR 性能报告，流程如下：
+
+1. **自动探测** — 检测远程服务器上的 Oracle 环境（`ORACLE_HOME`、`ORACLE_SID`）
+2. **输入时间范围** — 指定起止时间（格式 `YYYY-MM-DD HH24:MI`），程序查询该时间段内的 AWR 快照
+3. **选择快照** — 展示快照列表，用户选择起止快照 ID（支持 RAC 多实例选择）
+4. **生成并下载** — 调用 `DBMS_WORKLOAD_REPOSITORY.AWR_REPORT_HTML` 生成 HTML 报告，自动下载到本地
+
+报告保存路径：`<脚本目录>/awr_reports/awr_<SID>_<begin_snap>_<end_snap>.html`
+
+> 要求：远程服务器上的 Oracle 用户需具备 DBA 角色权限以访问 `DBA_HIST_SNAPSHOT` 视图。
 
 ## 诊断脚本检测维度
 
