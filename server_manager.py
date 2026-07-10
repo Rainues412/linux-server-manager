@@ -509,40 +509,42 @@ def fetch_awr_report(ssh):
     console.print(f"  [green]✔[/green] ORACLE_SID  = [bold]{oracle_sid}[/bold]")
     console.print(f"  [green]✔[/green] sqlplus     = [dim]{sqlplus_path}[/dim]")
 
-    # ── Step 2: 用户输入时间范围 ──
-    console.print()
-    console.print("  [bold]请输入时间范围[/bold] (格式: YYYY-MM-DD HH24:MI)")
-    console.print("  [dim]示例: 2026-06-08 08:00  |  输入 q 返回主菜单[/dim]")
-
+    # ── Step 2 & 3: 输入时间范围 + 查询快照（支持重新输入） ──
+    snapshots = []
     while True:
-        start_time = Prompt.ask("\n  起始时间")
-        if start_time.strip().lower() == 'q':
-            console.print("[dim]已取消 AWR 拉取，返回主菜单...[/dim]")
-            return
-        try:
-            start_dt = datetime.strptime(start_time, "%Y-%m-%d %H:%M")
-            break
-        except ValueError:
-            console.print("  [yellow]⚠ 时间格式错误，请使用 YYYY-MM-DD HH:MI 格式[/yellow]")
+        console.print()
+        console.print("  [bold]请输入时间范围[/bold] (格式: YYYY-MM-DD HH24:MI)")
+        console.print("  [dim]示例: 2026-06-08 08:00  |  输入 q 返回主菜单[/dim]")
 
-    while True:
-        end_time = Prompt.ask("  结束时间")
-        if end_time.strip().lower() == 'q':
-            console.print("[dim]已取消 AWR 拉取，返回主菜单...[/dim]")
-            return
-        try:
-            end_dt = datetime.strptime(end_time, "%Y-%m-%d %H:%M")
-            if end_dt <= start_dt:
-                console.print("  [yellow]⚠ 结束时间必须晚于起始时间[/yellow]")
-                continue
-            break
-        except ValueError:
-            console.print("  [yellow]⚠ 时间格式错误，请使用 YYYY-MM-DD HH:MI 格式[/yellow]")
+        while True:
+            start_time = Prompt.ask("\n  起始时间")
+            if start_time.strip().lower() == 'q':
+                console.print("[dim]已取消 AWR 拉取，返回主菜单...[/dim]")
+                return
+            try:
+                start_dt = datetime.strptime(start_time, "%Y-%m-%d %H:%M")
+                break
+            except ValueError:
+                console.print("  [yellow]⚠ 时间格式错误，请使用 YYYY-MM-DD HH:MI 格式[/yellow]")
 
-    # ── Step 3: 查询时间段内的快照 ──
-    console.print()
-    with console.status("[bold cyan]正在查询快照...[/bold cyan]"):
-        sql_query = f"""
+        while True:
+            end_time = Prompt.ask("  结束时间")
+            if end_time.strip().lower() == 'q':
+                console.print("[dim]已取消 AWR 拉取，返回主菜单...[/dim]")
+                return
+            try:
+                end_dt = datetime.strptime(end_time, "%Y-%m-%d %H:%M")
+                if end_dt <= start_dt:
+                    console.print("  [yellow]⚠ 结束时间必须晚于起始时间[/yellow]")
+                    continue
+                break
+            except ValueError:
+                console.print("  [yellow]⚠ 时间格式错误，请使用 YYYY-MM-DD HH:MI 格式[/yellow]")
+
+        # 查询时间段内的快照
+        console.print()
+        with console.status("[bold cyan]正在查询快照...[/bold cyan]"):
+            sql_query = f"""
 SELECT s.snap_id,
        TO_CHAR(s.begin_interval_time, 'YYYY-MM-DD"T"HH24:MI:SS'),
        TO_CHAR(s.end_interval_time,   'YYYY-MM-DD"T"HH24:MI:SS'),
@@ -553,50 +555,73 @@ WHERE  s.begin_interval_time >= TO_DATE('{start_time}', 'YYYY-MM-DD HH24:MI')
 AND    s.end_interval_time   <= TO_DATE('{end_time}',   'YYYY-MM-DD HH24:MI')
 ORDER BY s.instance_number, s.snap_id;
 """
-        exit_code, stdout, stderr = run_sql_as_oracle(ssh, oracle_home, oracle_sid, sql_query, timeout=30)
+            exit_code, stdout, stderr = run_sql_as_oracle(ssh, oracle_home, oracle_sid, sql_query, timeout=30)
 
-    # 检查权限错误
-    if "ORA-00942" in stdout or "ORA-01031" in stdout:
-        console.print(Panel(
-            "[red]权限不足[/red]\n\n需要 DBA 角色才能访问 AWR 数据 (DBA_HIST_SNAPSHOT)",
-            title="❌ 错误",
-            border_style="red",
-        ))
-        return
+        # 检查权限错误
+        if "ORA-00942" in stdout or "ORA-01031" in stdout:
+            console.print(Panel(
+                "[red]权限不足[/red]\n\n需要 DBA 角色才能访问 AWR 数据 (DBA_HIST_SNAPSHOT)",
+                title="❌ 错误",
+                border_style="red",
+            ))
+            return
 
-    # 解析快照列表
-    snapshots = []
-    for line in stdout.strip().split("\n"):
-        parts = line.split()
-        if len(parts) >= 5:
-            try:
-                snap_id = int(parts[0])
-                begin_time = parts[1].replace('T', ' ')
-                end_time_snap = parts[2].replace('T', ' ')
-                inst_num = int(parts[3])
-                dbid = int(parts[4])
-                snapshots.append({
-                    "snap_id": snap_id,
-                    "begin_time": begin_time,
-                    "end_time": end_time_snap,
-                    "instance_number": inst_num,
-                    "dbid": dbid,
-                })
-            except (ValueError, IndexError):
+        # 解析快照列表
+        snapshots = []
+        for line in stdout.strip().split("\n"):
+            parts = line.split()
+            if len(parts) >= 5:
+                try:
+                    snap_id = int(parts[0])
+                    begin_time = parts[1].replace('T', ' ')
+                    end_time_snap = parts[2].replace('T', ' ')
+                    inst_num = int(parts[3])
+                    dbid = int(parts[4])
+                    snapshots.append({
+                        "snap_id": snap_id,
+                        "begin_time": begin_time,
+                        "end_time": end_time_snap,
+                        "instance_number": inst_num,
+                        "dbid": dbid,
+                    })
+                except (ValueError, IndexError):
+                    continue
+
+        # 无快照
+        if not snapshots:
+            console.print(Panel(
+                f"[yellow]指定时间段 ({start_time} ~ {end_time}) 内未找到快照数据[/yellow]\n\n"
+                "可能原因：\n"
+                "  1. 该时间段内 AWR 未开启或无快照\n"
+                "  2. 时间范围过窄，没有覆盖完整的快照周期\n"
+                "  3. 数据库实例在该时间段未运行",
+                title="⚠ 无快照",
+                border_style="yellow",
+            ))
+            retry = Prompt.ask("\n  是否重新输入时间范围？([bold cyan]y[/bold cyan]/n)", default="y")
+            if retry.strip().lower() in ('y', 'yes', ''):
                 continue
+            else:
+                console.print("[dim]已取消 AWR 拉取，返回主菜单...[/dim]")
+                return
 
-    # 无快照
-    if not snapshots:
-        console.print(Panel(
-            f"[red]指定时间段 ({start_time} ~ {end_time}) 内未找到快照数据[/red]\n\n"
-            "可能原因：\n"
-            "  1. 该时间段内 AWR 未开启或无快照\n"
-            "  2. 时间范围过窄，没有覆盖完整的快照周期\n"
-            "  3. 数据库实例在该时间段未运行",
-            title="❌ 错误",
-            border_style="red",
-        ))
-        return
+        # 快照数量不足（生成 AWR 至少需要 2 个快照）
+        if len(snapshots) < 2:
+            console.print(Panel(
+                f"[yellow]指定时间段 ({start_time} ~ {end_time}) 内仅有 {len(snapshots)} 个快照[/yellow]\n\n"
+                "生成 AWR 报告至少需要 2 个快照（起始 + 结束），请扩大时间范围后重试。",
+                title="⚠ 快照不足",
+                border_style="yellow",
+            ))
+            retry = Prompt.ask("\n  是否重新输入时间范围？([bold cyan]y[/bold cyan]/n)", default="y")
+            if retry.strip().lower() in ('y', 'yes', ''):
+                continue
+            else:
+                console.print("[dim]已取消 AWR 拉取，返回主菜单...[/dim]")
+                return
+
+        # 快照充足，继续
+        break
 
     # 展示快照列表
     console.print()
