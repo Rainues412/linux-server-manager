@@ -65,7 +65,11 @@ python server_manager.py
 3. **选择快照** — 展示快照列表，用户选择起止快照 ID（支持 RAC 多实例选择）
 4. **生成并下载** — 调用 `DBMS_WORKLOAD_REPOSITORY.AWR_REPORT_HTML` 生成 HTML 报告，自动下载到本地
 
-报告保存路径：`<脚本目录>/awr_reports/awr_<SID>_<begin_snap>_<end_snap>.html`
+在以上任何输入步骤中，输入 `q` 即可取消本次 AWR 拉取并返回主菜单（不断开 SSH 连接）。
+
+报告保存路径：`<脚本目录>/awr_reports/awr_<SID>_<begin_snap>_<end_snap>_<日期时间>.html`
+
+> 每次生成的报告文件名带有时间戳后缀，不会覆盖历史报告。
 
 > 要求：远程服务器上的 Oracle 用户需具备 DBA 角色权限以访问 `DBA_HIST_SNAPSHOT` 视图。
 

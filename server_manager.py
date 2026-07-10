@@ -512,10 +512,13 @@ def fetch_awr_report(ssh):
     # ── Step 2: 用户输入时间范围 ──
     console.print()
     console.print("  [bold]请输入时间范围[/bold] (格式: YYYY-MM-DD HH24:MI)")
-    console.print("  [dim]示例: 2026-06-08 08:00[/dim]")
+    console.print("  [dim]示例: 2026-06-08 08:00  |  输入 q 返回主菜单[/dim]")
 
     while True:
         start_time = Prompt.ask("\n  起始时间")
+        if start_time.strip().lower() == 'q':
+            console.print("[dim]已取消 AWR 拉取，返回主菜单...[/dim]")
+            return
         try:
             start_dt = datetime.strptime(start_time, "%Y-%m-%d %H:%M")
             break
@@ -524,6 +527,9 @@ def fetch_awr_report(ssh):
 
     while True:
         end_time = Prompt.ask("  结束时间")
+        if end_time.strip().lower() == 'q':
+            console.print("[dim]已取消 AWR 拉取，返回主菜单...[/dim]")
+            return
         try:
             end_dt = datetime.strptime(end_time, "%Y-%m-%d %H:%M")
             if end_dt <= start_dt:
@@ -636,16 +642,33 @@ ORDER BY s.instance_number, s.snap_id;
 
     # ── Step 4: 用户选择起止快照 ID ──
     console.print()
+    console.print("  [dim]提示: 输入 q 可返回主菜单[/dim]")
     valid_ids = [s["snap_id"] for s in instance_snapshots]
 
     while True:
-        begin_snap = IntPrompt.ask("  起始快照 ID (begin)")
+        begin_input = Prompt.ask("\n  起始快照 ID (begin)")
+        if begin_input.strip().lower() == 'q':
+            console.print("[dim]已取消 AWR 拉取，返回主菜单...[/dim]")
+            return
+        try:
+            begin_snap = int(begin_input)
+        except ValueError:
+            console.print(f"  [yellow]⚠ 请输入数字，可选范围: {min(valid_ids)} ~ {max(valid_ids)}[/yellow]")
+            continue
         if begin_snap in valid_ids:
             break
         console.print(f"  [yellow]⚠ 无效的快照 ID，可选范围: {min(valid_ids)} ~ {max(valid_ids)}[/yellow]")
 
     while True:
-        end_snap = IntPrompt.ask("  结束快照 ID (end)")
+        end_input = Prompt.ask("  结束快照 ID (end)")
+        if end_input.strip().lower() == 'q':
+            console.print("[dim]已取消 AWR 拉取，返回主菜单...[/dim]")
+            return
+        try:
+            end_snap = int(end_input)
+        except ValueError:
+            console.print(f"  [yellow]⚠ 请输入数字，必须大于 {begin_snap} 且在可选范围内[/yellow]")
+            continue
         if end_snap in valid_ids and end_snap > begin_snap:
             break
         console.print(f"  [yellow]⚠ 无效的快照 ID，必须大于 {begin_snap} 且在可选范围内[/yellow]")
@@ -655,7 +678,8 @@ ORDER BY s.instance_number, s.snap_id;
 
     # ── Step 5: 生成 AWR HTML 报告 ──
     console.print()
-    report_filename = f"awr_{oracle_sid}_{begin_snap}_{end_snap}.html"
+    date_suffix = datetime.now().strftime("%Y%m%d_%H%M%S")
+    report_filename = f"awr_{oracle_sid}_{begin_snap}_{end_snap}_{date_suffix}.html"
     remote_report_path = f"/tmp/{report_filename}"
 
     with console.status("[bold cyan]正在生成 AWR 报告 (可能需要 10-30 秒)...[/bold cyan]"):
